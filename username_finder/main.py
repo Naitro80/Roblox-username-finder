@@ -10,9 +10,15 @@ import time
 import requests
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from itertools import islice
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from colorama import Back, Fore, Style, init
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 LOGO = r"""
 ███╗░░██╗██╗░░██╗
@@ -34,22 +40,39 @@ RED = Fore.RED
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 WORDS_PATH = os.path.join(BASE_DIR, "words.txt")
+LISTS_DIR = os.path.join(BASE_DIR, "lists")
 
 WEBHOOK_RE = re.compile(
     r"^https://(?:(?:canary|ptb)\.)?discord(?:app)?\.com/api/(?:v\d+/)?webhooks/\d+/[\w-]+$"
 )
+ROBLOX_NAME_RE = re.compile(r"^(?!_)(?!.*_.*_)(?!.*_$)[a-z0-9_]{3,20}$")
+MC_NAME_RE = re.compile(r"^[a-z0-9_]{3,16}$")
 
 LETTERS = string.ascii_lowercase
 ALNUM = LETTERS + string.digits
 CONSONANTS = "bcdfghjklmnpqrstvwxyz"
 VOWELS = "aeiou"
 
-WORKERS = 8
 CHUNK_SIZE = 200
 PASS_PAUSE = 5
 MAX_COOLDOWN = 120.0
 
+DEFAULTS = {
+    "message_style": "embed",
+    "roblox_speed": "fast",
+    "minecraft_both": True,
+    "show_all": False,
+}
+
+ROBLOX_PROFILES = {
+    "safe": {"pacer": (0.25, 0.15, 10.0, 5.0), "workers": 4},
+    "normal": {"pacer": (0.12, 0.08, 10.0, 5.0), "workers": 6},
+    "fast": {"pacer": (0.08, 0.04, 10.0, 5.0), "workers": 8},
+}
+
 ROBLOX_CHECK_URL = "https://auth.roblox.com/v1/usernames/validate?Username={}&Birthday=2000-01-01"
+MC_BULK_URL_A = "https://api.minecraftservices.com/minecraft/profile/lookup/bulk/byname"
+MC_BULK_URL_B = "https://api.mojang.com/profiles/minecraft"
 MC_CHECK_URL = "https://api.minecraftservices.com/minecraft/profile/lookup/name/{}"
 
 NETWORK_ERRORS = (
@@ -65,6 +88,10 @@ print_lock = Lock()
 count_lock = Lock()
 notify_queue = queue.Queue()
 seen = set()
+config = {}
+
+resume_event = Event()
+resume_event.set()
 
 session = requests.Session()
 session.headers.update({
@@ -79,6 +106,10 @@ class RateLimited(Exception):
         self.retry_after = retry_after
 
 
+class EndpointGone(Exception):
+    pass
+
+
 class Pacer:
     def __init__(self, delay, min_delay, max_delay, cooldown):
         self.delay = delay
@@ -91,6 +122,7 @@ class Pacer:
         self.lock = Lock()
 
     def wait(self):
+        resume_event.wait()
         with self.lock:
             now = time.time()
             start = max(now, self.next_at)
@@ -127,6 +159,7 @@ class Stats:
         self.webhook = False
         self.label = ""
         self.mode_label = ""
+        self.filename = ""
         self.checked = 0
         self.found = 0
         self.limited = 0
@@ -140,6 +173,32 @@ class Stats:
 
 
 stats = Stats()
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(data):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
+
+
+def get_setting(key):
+    return config.get(key, DEFAULTS[key])
+
+
+def set_setting(key, value):
+    config[key] = value
+    save_config(config)
 
 
 def header_seconds(response):
@@ -172,22 +231,76 @@ def minecraft_check(name):
     return "invalid"
 
 
-PLATFORMS = {
-    "roblox": {
-        "label": "Roblox",
-        "charset": ALNUM,
-        "check": roblox_check,
-        "file": os.path.join(BASE_DIR, "available_roblox.txt"),
-        "pacer": Pacer(0.08, 0.04, 10.0, 5.0),
-    },
-    "minecraft": {
-        "label": "Minecraft",
-        "charset": ALNUM + "_",
-        "check": minecraft_check,
-        "file": os.path.join(BASE_DIR, "available_minecraft.txt"),
-        "pacer": Pacer(1.1, 1.0, 15.0, 15.0),
-    },
-}
+def make_minecraft_bulk(url):
+    def bulk(batch):
+        r = session.post(url, json=batch, timeout=10)
+        if r.status_code == 429:
+            raise RateLimited(header_seconds(r))
+        if r.status_code in (404, 405, 410):
+            raise EndpointGone()
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            raise ValueError("unexpected response")
+        return {p["name"].lower() for p in data}
+
+    return bulk
+
+
+def valid_roblox(name):
+    return bool(ROBLOX_NAME_RE.match(name))
+
+
+def valid_minecraft(name):
+    return bool(MC_NAME_RE.match(name))
+
+
+def build_platforms():
+    profile = ROBLOX_PROFILES[get_setting("roblox_speed")]
+    delay, min_delay, max_delay, cooldown = profile["pacer"]
+
+    lanes = [
+        {
+            "name": "services",
+            "bulk": make_minecraft_bulk(MC_BULK_URL_A),
+            "pacer": Pacer(1.1, 1.0, 15.0, 15.0),
+            "dead": False,
+        },
+        {
+            "name": "mojang",
+            "bulk": make_minecraft_bulk(MC_BULK_URL_B),
+            "pacer": Pacer(1.1, 1.0, 15.0, 15.0),
+            "dead": False,
+        },
+    ]
+    if not get_setting("minecraft_both"):
+        lanes = lanes[:1]
+
+    return {
+        "roblox": {
+            "label": "Roblox",
+            "charset": ALNUM,
+            "check": roblox_check,
+            "valid": valid_roblox,
+            "lanes": None,
+            "batch": 1,
+            "workers": profile["workers"],
+            "file": os.path.join(BASE_DIR, "available_roblox.txt"),
+            "pacer": Pacer(delay, min_delay, max_delay, cooldown),
+        },
+        "minecraft": {
+            "label": "Minecraft",
+            "charset": ALNUM + "_",
+            "check": minecraft_check,
+            "valid": valid_minecraft,
+            "lanes": lanes,
+            "batch": 10,
+            "workers": 8,
+            "file": os.path.join(BASE_DIR, "available_minecraft.txt"),
+            "pacer": lanes[0]["pacer"],
+        },
+    }
+
 
 RARE_SHAPES = {
     3: {"pron": ["CVC", "VCV"], "rep": ["AAA", "AAB", "ABA", "ABB"]},
@@ -231,8 +344,11 @@ def rare_names(length, charset):
     return names
 
 
-def build_names(platform, mode, lengths):
+def build_names(platform, mode, lengths, custom=None):
     charset = platform["charset"]
+    if mode == "list":
+        return list(custom), len(custom)
+
     if mode == "rare":
         names = []
         for length in lengths:
@@ -248,6 +364,18 @@ def build_names(platform, mode, lengths):
                 yield "".join(combo)
 
     return generate(), total
+
+
+def load_list(path, platform):
+    try:
+        with open(path, encoding="utf-8-sig", errors="ignore") as f:
+            text = f.read()
+    except OSError:
+        return [], 0, 0
+    raw = [t.lower() for t in re.split(r"[\s,;]+", text) if t]
+    unique = list(dict.fromkeys(raw))
+    valid = [n for n in unique if platform["valid"](n)]
+    return valid, len(unique) - len(valid), len(raw) - len(unique)
 
 
 def fmt_int(number):
@@ -273,14 +401,15 @@ def render_status():
     pct = min(stats.pass_done / stats.pass_total, 1.0) if stats.pass_total else 0.0
     filled = int(pct * 14)
     bar = "█" * filled + "░" * (14 - filled)
-    pause = max((p.pause_left() for p in stats.pacers), default=0.0)
+    pause = min((p.pause_left() for p in stats.pacers), default=0.0)
+    paused = not resume_event.is_set()
 
-    parts = [
-        (f" {stats.label.upper()} · {stats.mode_label.upper()} ", Back.CYAN + Fore.BLACK),
-        (f"{bar} {pct * 100:5.1f}%", CYAN),
-    ]
-    if pause >= 1:
-        parts.append((f"pause {int(pause)}s", YELLOW))
+    parts = [(f" {stats.label.upper()} · {stats.mode_label.upper()} ", Back.CYAN + Fore.BLACK)]
+    if paused:
+        parts.append((" PAUSED ", Back.YELLOW + Fore.BLACK))
+    parts.append((f"{bar} {pct * 100:5.1f}%", CYAN))
+    if pause >= 1 and not paused:
+        parts.append((f"wait {int(pause)}s", YELLOW))
     parts.append((f"hits {stats.found}", GREEN if stats.found else GRAY))
     parts.append((f"{stats.rate:.1f}/s", RESET))
     parts.append((f"{fmt_int(stats.checked)} checked", RESET))
@@ -290,9 +419,11 @@ def render_status():
     if stats.limited:
         parts.append((f"429 x{stats.limited}", YELLOW))
     remaining = stats.pass_total - stats.pass_done
-    if stats.rate > 0 and remaining > 0:
+    if stats.rate > 0 and remaining > 0 and not paused:
         parts.append((f"ETA {fmt_duration(remaining / stats.rate)}", GRAY))
     parts.append((f"time {fmt_duration(time.time() - stats.started)}", GRAY))
+    if msvcrt:
+        parts.append(("P pause · Q quit", GRAY))
 
     while len(parts) > 2 and sum(len(t) for t, _ in parts) + 3 * (len(parts) - 1) > width:
         parts.pop()
@@ -322,10 +453,81 @@ def status_loop():
         time.sleep(0.5)
 
 
+def print_exit_summary(filename):
+    sys.stdout.write("\r\x1b[2K")
+    print()
+    print(GRAY + "  " + "─" * 48 + RESET)
+    print(f"  {BOLD}Stopped{RESET}")
+    print(f"  {GRAY}Checked{RESET}  {fmt_int(stats.checked)}")
+    print(f"  {GRAY}Hits{RESET}     {stats.found}  {GRAY}saved in {os.path.basename(filename)}{RESET}")
+    print(f"  {GRAY}Time{RESET}     {fmt_duration(time.time() - stats.started)}")
+    print()
+    sys.stdout.flush()
+
+
+def quit_now():
+    stats.running = False
+    resume_event.set()
+    with print_lock:
+        print_exit_summary(stats.filename)
+    os._exit(0)
+
+
+def toggle_pause():
+    if resume_event.is_set():
+        resume_event.clear()
+        log(f"{YELLOW}  Paused. Press P to resume.{RESET}")
+    else:
+        resume_event.set()
+        log(f"{GREEN}  Resumed.{RESET}")
+
+
+def key_listener():
+    while True:
+        if msvcrt.kbhit():
+            key = msvcrt.getwch()
+            if key in ("\x00", "\xe0"):
+                msvcrt.getwch()
+                continue
+            key = key.lower()
+            if key == "p":
+                toggle_pause()
+            elif key == "q":
+                quit_now()
+        time.sleep(0.05)
+
+
+def build_payload(label, name):
+    if get_setting("message_style") == "plain":
+        return {"username": "Username Finder", "content": f"Available - {name} ({label})"}
+
+    if label == "Minecraft":
+        verify = f"[Check on NameMC](https://namemc.com/search?q={name})"
+    else:
+        verify = f"[Search on Roblox](https://www.roblox.com/search/users?keyword={name})"
+
+    return {
+        "username": "Username Finder",
+        "embeds": [{
+            "title": "✅ Username available",
+            "description": f"**`{name}`**",
+            "color": 0x57F287,
+            "fields": [
+                {"name": "Platform", "value": label, "inline": True},
+                {"name": "Length", "value": f"{len(name)} characters", "inline": True},
+                {"name": "Found", "value": f"<t:{int(time.time())}:R>", "inline": True},
+                {"name": "Verify", "value": verify, "inline": False},
+            ],
+            "footer": {"text": "Username Finder"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }],
+    }
+
+
 def webhook_worker(url):
     while True:
         label, name = notify_queue.get()
-        payload = {"content": f"Available - {name} ({label})"}
+        payload = build_payload(label, name)
         for _ in range(5):
             try:
                 r = requests.post(url, json=payload, timeout=8)
@@ -367,6 +569,12 @@ def mark_done(name, checked=True):
         stats.current = name
 
 
+def log_status(status, name):
+    labels = {"taken": (GRAY, "TAKEN"), "blocked": (RED, "BLOCKED"), "invalid": (YELLOW, "INVALID")}
+    color, text = labels[status]
+    log(f"{color}  {text:<8}{name}{RESET}")
+
+
 def check_name(platform, name, output_file):
     pacer = platform["pacer"]
     failures = 0
@@ -392,21 +600,118 @@ def check_name(platform, name, output_file):
         if status == "valid":
             register_hit(platform, name, output_file)
         elif stats.verbose:
-            labels = {"taken": (GRAY, "TAKEN"), "blocked": (RED, "BLOCKED"), "invalid": (YELLOW, "INVALID")}
-            color, text = labels[status]
-            log(f"{color}  {text:<8}{name}{RESET}")
+            log_status(status, name)
         return
 
 
-def run(platform, mode, lengths, output_file):
+def lookup_batch(lane, batch):
+    pacer = lane["pacer"]
+    failures = 0
+    while True:
+        pacer.wait()
+        try:
+            taken = lane["bulk"](batch)
+        except RateLimited as e:
+            stats.limited += 1
+            pacer.limited(e.retry_after)
+            continue
+        except NETWORK_ERRORS:
+            failures += 1
+            if failures >= 6:
+                log(f"{YELLOW}  skipped {batch[0]} to {batch[-1]} (network error){RESET}")
+                return None
+            time.sleep(5)
+            continue
+        pacer.ok()
+        return taken
+
+
+def confirm_task(platform, name, output_file):
+    pacer = platform["pacer"]
+    for _ in range(10):
+        pacer.wait()
+        try:
+            status = platform["check"](name)
+        except RateLimited as e:
+            stats.limited += 1
+            pacer.limited(e.retry_after)
+            continue
+        except NETWORK_ERRORS:
+            time.sleep(2)
+            continue
+        pacer.ok()
+        if status == "valid":
+            register_hit(platform, name, output_file)
+        elif stats.verbose:
+            log_status(status, name)
+        return
+    log(f"{YELLOW}  could not confirm {name}{RESET}")
+
+
+def scan_single(platform, names, output_file, executor):
+    for chunk in chunked(names, CHUNK_SIZE):
+        list(executor.map(lambda name: check_name(platform, name, output_file), chunk))
+
+
+def scan_bulk(platform, names, output_file, executor):
+    lanes = platform["lanes"]
+    batches = chunked(names, platform["batch"])
+    batch_lock = Lock()
+
+    def next_batch():
+        with batch_lock:
+            return next(batches, None)
+
+    def lane_worker(lane):
+        while True:
+            batch = next_batch()
+            if batch is None:
+                return
+            stats.current = batch[-1]
+            while True:
+                try:
+                    taken = lookup_batch(lane, batch)
+                    break
+                except EndpointGone:
+                    lane["dead"] = True
+                    alive = [item for item in lanes if not item["dead"]]
+                    if not alive:
+                        log(f"{RED}  no working Minecraft endpoint left{RESET}")
+                        return
+                    log(f"{YELLOW}  {lane['name']} endpoint unavailable, using {alive[0]['name']}{RESET}")
+                    lane = alive[0]
+            with count_lock:
+                stats.pass_done += len(batch)
+                if taken is not None:
+                    stats.checked += len(batch)
+            if taken is None:
+                continue
+            if stats.verbose:
+                lines = [f"{GRAY}  TAKEN   {n}{RESET}" for n in batch if n in taken]
+                if lines:
+                    log("\n".join(lines))
+            for name in batch:
+                if name not in taken:
+                    executor.submit(confirm_task, platform, name, output_file)
+
+    threads = [Thread(target=lane_worker, args=(lane,), daemon=True) for lane in lanes]
+    for thread in threads:
+        thread.start()
+    while any(thread.is_alive() for thread in threads):
+        time.sleep(0.2)
+
+
+def run(platform, mode, lengths, output_file, custom=None):
     while True:
         stats.pass_no += 1
-        names, total = build_names(platform, mode, lengths)
+        names, total = build_names(platform, mode, lengths, custom)
         stats.pass_total = total
         stats.pass_done = 0
-        executor = ThreadPoolExecutor(max_workers=WORKERS)
-        for chunk in chunked(names, CHUNK_SIZE):
-            list(executor.map(lambda name: check_name(platform, name, output_file), chunk))
+        executor = ThreadPoolExecutor(max_workers=platform["workers"])
+        if platform["lanes"]:
+            scan_bulk(platform, names, output_file, executor)
+        else:
+            scan_single(platform, names, output_file, executor)
         executor.shutdown(wait=True)
         log(f"{CYAN}  Pass {stats.pass_no} done{RESET}{GRAY} · {stats.found} hits so far · starting over...{RESET}")
         time.sleep(PASS_PAUSE)
@@ -428,35 +733,26 @@ def header(summary=()):
     print()
 
 
-def menu(title, options, summary):
+def menu(title, options, summary, back=True, note=""):
     while True:
         header(summary)
-        print(f"  {BOLD}{title}{RESET}\n")
+        print(f"  {BOLD}{title}{RESET}")
+        if note:
+            print(f"  {GRAY}{note}{RESET}")
+        print()
         for number, (label, hint) in enumerate(options, 1):
             line = f"   {CYAN}[{number}]{RESET} {label}"
             if hint:
                 line += f"  {GRAY}{hint}{RESET}"
             print(line)
+        if back:
+            print(f"   {CYAN}[0]{RESET} {GRAY}Back{RESET}")
         print()
         choice = input(f"  {CYAN}»{RESET} ").strip()
+        if back and choice == "0":
+            return None
         if choice.isdigit() and 1 <= int(choice) <= len(options):
             return int(choice) - 1
-
-
-def load_config():
-    try:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
-
-
-def save_config(config):
-    try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2)
-    except OSError:
-        pass
 
 
 def mask_webhook(url):
@@ -464,34 +760,27 @@ def mask_webhook(url):
 
 
 def test_webhook(url):
+    payload = {
+        "username": "Username Finder",
+        "embeds": [{
+            "title": "Connected",
+            "description": "Alerts will show up here when a username is available.",
+            "color": 0x5865F2,
+            "footer": {"text": "Username Finder"},
+        }],
+    }
     try:
-        r = requests.post(url, json={"content": "Username Finder connected"}, timeout=8)
+        r = requests.post(url, json=payload, timeout=8)
         return r.status_code < 300
     except requests.exceptions.RequestException:
         return False
 
 
-def setup_webhook():
-    config = load_config()
-    saved = config.get("webhook", "")
-    if saved and WEBHOOK_RE.match(saved):
-        while True:
-            header()
-            print(f"  {BOLD}Discord webhook{RESET}\n")
-            print(f"  Saved: {GRAY}{mask_webhook(saved)}{RESET}\n")
-            print(f"   {CYAN}[Enter]{RESET} use it   {CYAN}[n]{RESET} enter a new one   {CYAN}[s]{RESET} skip\n")
-            choice = input(f"  {CYAN}»{RESET} ").strip().lower()
-            if choice == "":
-                return saved
-            if choice == "s":
-                return None
-            if choice == "n":
-                break
-
+def prompt_new_webhook(intro):
     while True:
         header()
         print(f"  {BOLD}Discord webhook{RESET}\n")
-        print("  Paste your webhook URL, or press Enter to skip.\n")
+        print(f"  {intro}\n")
         url = input(f"  {CYAN}»{RESET} ").strip()
         if not url:
             return None
@@ -502,22 +791,226 @@ def setup_webhook():
         print(f"\n  {GRAY}Sending a test message...{RESET}")
         if test_webhook(url):
             config["webhook"] = url
+            config.pop("webhook_skipped", None)
             save_config(config)
             return url
         print(f"\n  {RED}Discord didn't accept it. Check the URL and try again.{RESET}")
         time.sleep(2)
 
 
-def print_exit_summary(filename):
-    sys.stdout.write("\r\x1b[2K")
+def first_run_webhook():
+    url = prompt_new_webhook(
+        "Paste your Discord webhook URL to get alerts, or press Enter to skip.\n"
+        "  You can change it later in Settings."
+    )
+    if url is None:
+        config["webhook_skipped"] = True
+        save_config(config)
+
+
+def webhook_menu():
+    while True:
+        saved = config.get("webhook")
+        current = mask_webhook(saved) if saved else "not set"
+        index = menu(
+            "Discord webhook",
+            [
+                ("Enter a new webhook", ""),
+                ("Send a test message", ""),
+                ("Remove webhook", ""),
+            ],
+            [],
+            note=f"Current: {current}",
+        )
+        if index is None:
+            return
+        if index == 0:
+            prompt_new_webhook("Paste your webhook URL, or press Enter to go back.")
+        elif index == 1:
+            if not saved:
+                print(f"\n  {YELLOW}No webhook set yet.{RESET}")
+            elif test_webhook(saved):
+                print(f"\n  {GREEN}Test message sent.{RESET}")
+            else:
+                print(f"\n  {RED}Discord didn't accept the test message.{RESET}")
+            time.sleep(1.5)
+        else:
+            config.pop("webhook", None)
+            config["webhook_skipped"] = True
+            save_config(config)
+
+
+def settings_menu():
+    speeds = ["safe", "normal", "fast"]
+    while True:
+        options = [
+            ("Discord webhook", "connected" if config.get("webhook") else "off"),
+            ("Discord message style", "Embed" if get_setting("message_style") == "embed" else "Plain text"),
+            ("Roblox speed", get_setting("roblox_speed").capitalize()),
+            ("Minecraft endpoints", "Both (faster)" if get_setting("minecraft_both") else "One"),
+            ("Show every name", "Yes" if get_setting("show_all") else "No"),
+        ]
+        index = menu("Settings", options, [], note="Pick a setting to change it.")
+        if index is None:
+            return
+        if index == 0:
+            webhook_menu()
+        elif index == 1:
+            set_setting("message_style", "plain" if get_setting("message_style") == "embed" else "embed")
+        elif index == 2:
+            current = speeds.index(get_setting("roblox_speed"))
+            set_setting("roblox_speed", speeds[(current + 1) % len(speeds)])
+        elif index == 3:
+            set_setting("minecraft_both", not get_setting("minecraft_both"))
+        elif index == 4:
+            set_setting("show_all", not get_setting("show_all"))
+
+
+def ask_path():
+    header()
+    print(f"  {BOLD}Import a list{RESET}\n")
+    print("  Paste the full path to a .txt file, or press Enter to go back.\n")
+    raw = input(f"  {CYAN}»{RESET} ").strip().strip('"').strip("'")
+    if not raw:
+        return None
+    if not os.path.isfile(raw):
+        print(f"\n  {RED}File not found.{RESET}")
+        time.sleep(2)
+        return None
+    return raw
+
+
+def choose_list(platform, summary):
+    os.makedirs(LISTS_DIR, exist_ok=True)
+    note = "Put .txt files in the 'lists' folder next to main.py. One name per line."
+    while True:
+        files = sorted(f for f in os.listdir(LISTS_DIR) if f.lower().endswith(".txt"))
+        options = [(name, "") for name in files] + [("Enter a file path", "")]
+        index = menu("Choose a list", options, summary, note=note)
+        if index is None:
+            return None
+        if index < len(files):
+            path = os.path.join(LISTS_DIR, files[index])
+        else:
+            path = ask_path()
+            if path is None:
+                continue
+        names, skipped, duplicates = load_list(path, platform)
+        if not names:
+            print(f"\n  {RED}No valid {platform['label']} usernames found in that file.{RESET}")
+            time.sleep(2.5)
+            continue
+        return names, os.path.basename(path), skipped, duplicates
+
+
+def webhook_line():
+    return ("Webhook", f"{GREEN}connected{RESET}" if config.get("webhook") else f"{GRAY}off{RESET}")
+
+
+def start_scan():
+    platforms = build_platforms()
+    summary = [webhook_line()]
+    keys = ["roblox", "minecraft"]
+
+    minecraft_hint = "a-z 0-9 _ · bulk lookup"
+    if len(platforms["minecraft"]["lanes"]) > 1:
+        minecraft_hint += ", 2 endpoints"
+    index = menu(
+        "Choose platform",
+        [("Roblox", "a-z 0-9"), ("Minecraft", minecraft_hint)],
+        summary,
+    )
+    if index is None:
+        return
+    platform = platforms[keys[index]]
+    summary.append(("Platform", platform["label"]))
+
+    index = menu(
+        "Choose source",
+        [
+            ("Rare usernames", "pronounceable names, patterns, words.txt"),
+            ("All combinations", "every possible name"),
+            ("Import .txt list", "check your own names"),
+        ],
+        summary,
+    )
+    if index is None:
+        return
+    mode = ["rare", "all", "list"][index]
+    mode_label = ["Rare", "All", "List"][index]
+    summary.append(("Mode", mode_label))
+
+    lengths = [3]
+    custom = None
+    skipped = 0
+    duplicates = 0
+    if mode == "list":
+        picked = choose_list(platform, summary)
+        if picked is None:
+            return
+        custom, list_name, skipped, duplicates = picked
+        summary.append(("List", list_name))
+    else:
+        index = menu(
+            "Name length",
+            [("3 characters", ""), ("4 characters", ""), ("3 and 4 characters", "")],
+            summary,
+        )
+        if index is None:
+            return
+        lengths = [[3], [4], [3, 4]][index]
+        summary.append(("Length", " and ".join(str(n) for n in lengths)))
+
+    seen.clear()
+    filename = platform["file"]
+    if os.path.exists(filename):
+        with open(filename) as f:
+            seen.update(line.strip() for line in f if line.strip())
+
+    header(summary)
+    total = build_names(platform, mode, lengths, custom)[1]
+    print(f"  {GRAY}Names per pass{RESET}  {fmt_int(total)}")
+    if mode == "list" and (skipped or duplicates):
+        print(f"  {GRAY}Skipped{RESET}         {skipped} invalid, {duplicates} duplicates")
+    if mode == "rare":
+        if os.path.exists(WORDS_PATH):
+            count = sum(len(load_words(length, platform["charset"])) for length in lengths)
+            print(f"  {GRAY}words.txt{RESET}       {fmt_int(count)} matching names")
+        else:
+            print(f"  {GRAY}words.txt{RESET}       not found (optional, put it next to main.py)")
+    print(f"  {GRAY}Results{RESET}         {os.path.basename(filename)}")
+    if msvcrt:
+        print(f"  {GRAY}Keys{RESET}            {CYAN}P{RESET} pause / resume   {CYAN}Q{RESET} quit")
+    else:
+        print(f"  {GRAY}Keys{RESET}            Ctrl+C to stop")
     print()
-    print(GRAY + "  " + "─" * 48 + RESET)
-    print(f"  {BOLD}Stopped{RESET}")
-    print(f"  {GRAY}Checked{RESET}  {fmt_int(stats.checked)}")
-    print(f"  {GRAY}Hits{RESET}     {stats.found}  {GRAY}saved in {os.path.basename(filename)}{RESET}")
-    print(f"  {GRAY}Time{RESET}     {fmt_duration(time.time() - stats.started)}")
+    input(f"  {CYAN}»{RESET} Press Enter to start ")
+
+    webhook_url = config.get("webhook")
+    stats.label = platform["label"]
+    stats.mode_label = mode_label
+    stats.filename = filename
+    stats.verbose = get_setting("show_all")
+    stats.webhook = bool(webhook_url)
+    if platform["lanes"]:
+        stats.pacers = [lane["pacer"] for lane in platform["lanes"]]
+    else:
+        stats.pacers = [platform["pacer"]]
+    stats.started = time.time()
+    stats.running = True
+
     print()
-    sys.stdout.flush()
+    if webhook_url:
+        Thread(target=webhook_worker, args=(webhook_url,), daemon=True).start()
+    Thread(target=status_loop, daemon=True).start()
+    if msvcrt:
+        Thread(target=key_listener, daemon=True).start()
+
+    try:
+        with open(filename, "a") as output_file:
+            run(platform, mode, lengths, output_file, custom)
+    except KeyboardInterrupt:
+        quit_now()
 
 
 def main():
@@ -527,83 +1020,28 @@ def main():
         pass
     init()
 
-    webhook_url = setup_webhook()
-    summary = [("Webhook", f"{GREEN}connected{RESET}" if webhook_url else f"{GRAY}off{RESET}")]
-
-    keys = ["roblox", "minecraft"]
-    index = menu(
-        "Choose platform",
-        [("Roblox", "a-z 0-9"), ("Minecraft", "a-z 0-9 _")],
-        summary,
-    )
-    platform = PLATFORMS[keys[index]]
-    summary.append(("Platform", platform["label"]))
-
-    index = menu(
-        "Choose mode",
-        [
-            ("Rare usernames", "pronounceable names, patterns like abab/aabb, words.txt"),
-            ("All combinations", "every possible name"),
-        ],
-        summary,
-    )
-    mode = ["rare", "all"][index]
-    mode_label = ["Rare", "All"][index]
-    summary.append(("Mode", mode_label))
-
-    index = menu(
-        "Name length",
-        [("3 characters", ""), ("4 characters", ""), ("3 and 4 characters", "")],
-        summary,
-    )
-    lengths = [[3], [4], [3, 4]][index]
-    summary.append(("Length", " and ".join(str(n) for n in lengths)))
-
-    index = menu(
-        "Display",
-        [
-            ("Clean live status", "recommended"),
-            ("Show every checked name", "scrolls fast"),
-        ],
-        summary,
-    )
-    stats.verbose = index == 1
-
-    filename = platform["file"]
-    if os.path.exists(filename):
-        with open(filename) as f:
-            seen.update(line.strip() for line in f if line.strip())
-
-    header(summary)
-    total = build_names(platform, mode, lengths)[1]
-    print(f"  {GRAY}Names per pass{RESET}  {fmt_int(total)}")
-    if mode == "rare":
-        if os.path.exists(WORDS_PATH):
-            count = sum(len(load_words(length, platform["charset"])) for length in lengths)
-            print(f"  {GRAY}words.txt{RESET}       {fmt_int(count)} matching names")
-        else:
-            print(f"  {GRAY}words.txt{RESET}       not found (optional, put it next to main.py)")
-    print(f"  {GRAY}Results{RESET}         {os.path.basename(filename)}")
-    print(f"  {GRAY}Press Ctrl+C to stop{RESET}\n")
-
-    stats.label = platform["label"]
-    stats.mode_label = mode_label
-    stats.webhook = bool(webhook_url)
-    stats.pacers = [platform["pacer"]]
-    stats.started = time.time()
-    stats.running = True
-
-    if webhook_url:
-        Thread(target=webhook_worker, args=(webhook_url,), daemon=True).start()
-    Thread(target=status_loop, daemon=True).start()
+    config.update(load_config())
+    os.makedirs(LISTS_DIR, exist_ok=True)
 
     try:
-        with open(filename, "a") as output_file:
-            run(platform, mode, lengths, output_file)
-    except KeyboardInterrupt:
-        stats.running = False
-        print_exit_summary(filename)
-        os._exit(0)
+        if not config.get("webhook") and not config.get("webhook_skipped"):
+            first_run_webhook()
+        while True:
+            index = menu(
+                "Main menu",
+                [("Start scan", ""), ("Settings", ""), ("Quit", "")],
+                [webhook_line()],
+                back=False,
+            )
+            if index == 0:
+                start_scan()
+            elif index == 1:
+                settings_menu()
+            else:
+                break
+    except (KeyboardInterrupt, EOFError):
+        pass
+    print()
 
 
 if __name__ == "__main__":
